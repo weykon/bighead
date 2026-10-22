@@ -1,0 +1,16 @@
+[package]
+name = "big-head-script"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+bevy_ecs = { path = "../../vendor/bevy_ecs", features = ["debug"] }
+big-head-ecs = { path = "../big-head-ecs" }
+big-head-ai = { path = "../big-head-ai" }
+big-head-query = { path = "../big-head-query" }
+big-head-save = { path = "../big-head-save" }
+rhai = { workspace = true }
+serde_json = { workspace = true }
+
+[lints]
+workspace = true

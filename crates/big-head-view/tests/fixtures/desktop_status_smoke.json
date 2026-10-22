@@ -1,0 +1,75 @@
+{
+  "op": "set_state",
+  "state": {
+    "title": "BigHead desktop smoke",
+    "subtitle": "Status, chat, notes, inspector, diagnostics, attachments",
+    "summary": "Fixture for release-readiness UI smoke checks.",
+    "items": [
+      {
+        "id": "smoke-choice-continue",
+        "title": "Continue desktop polish",
+        "state": "pending",
+        "control": "item",
+        "group": "choice",
+        "description": "Move on to visual regression and release polish.",
+        "priority": 50
+      },
+      {
+        "id": "smoke-checklist-chat",
+        "title": "Conversation feedback layer",
+        "state": "done",
+        "control": "checkbox",
+        "group": "checklist",
+        "checked": true,
+        "description": "Readable chat bubbles and local activity strip.",
+        "priority": 40
+      },
+      {
+        "id": "smoke-progress-release",
+        "title": "Release readiness",
+        "state": "running",
+        "control": "progress",
+        "group": "progress",
+        "description": "Packaging, diagnostics, attachments, and UI testing.",
+        "progress": 0.6,
+        "priority": 30
+      }
+    ],
+    "messages": [
+      {
+        "id": "smoke-message-user",
+        "role": "user",
+        "text": "Can I use the desktop app now?",
+        "created_at": 1786298400
+      },
+      {
+        "id": "smoke-message-assistant",
+        "role": "assistant",
+        "text": "## Current state\n\n- Status items render.\n- Notes render.\n- Attachment metadata is preserved.",
+        "created_at": 1786298401
+      }
+    ],
+    "documents": [
+      {
+        "id": "smoke-doc-release",
+        "title": "Desktop release smoke note",
+        "subtitle": "What this fixture proves",
+        "kind": "test",
+        "text": "## Smoke surface\n\nThis fixture exercises status items, chat Markdown, document references, and desktop attachment guidance.",
+        "references": [
+          {
+            "kind": "document",
+            "id": "docs/bighead-ambient-desktop-goal.md",
+            "title": "Ambient desktop goal"
+          },
+          {
+            "kind": "source",
+            "id": "desktop-surface-examples",
+            "title": "Desktop surface examples"
+          }
+        ],
+        "updated_at": 1786298402
+      }
+    ]
+  }
+}

@@ -1,0 +1,32 @@
+[package]
+name = "big-head-loop"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+bevy_ecs = { path = "../../vendor/bevy_ecs", features = ["debug"] }
+bevy_reflect = { path = "../../vendor/bevy_reflect" }
+big-head-ecs = { path = "../big-head-ecs" }
+big-head-save = { path = "../big-head-save" }
+big-head-script = { path = "../big-head-script" }
+big-head-ai = { path = "../big-head-ai" }
+big-head-query = { path = "../big-head-query" }
+big-head-cli = { path = "../big-head-cli" }
+big-head-shard = { path = "../big-head-shard" }
+big-head-state = { path = "../big-head-state" }
+big-head-view = { path = "../big-head-view" }
+big-head-world = { path = "../big-head-world" }
+rhai = { workspace = true, features = ["serde"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+log = { workspace = true }
+tokio = { workspace = true }
+uuid = { workspace = true }
+async-trait = "0.1"
+reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+regex-lite = "0.1"
+base64 = "0.22"
+mime_guess = "2"
+
+[lints]
+workspace = true

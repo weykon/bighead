@@ -1,0 +1,22 @@
+[package]
+name = "big-head-ai"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+ai_api_provider = { path = "../../external/ai_api_provider" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+log = { workspace = true }
+tokio = { workspace = true }
+futures = { workspace = true }
+big-head-state = { path = "../big-head-state" }
+big-head-ecs = { path = "../big-head-ecs" }
+async-trait = "0.1"
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+rhai = { workspace = true }

@@ -1,0 +1,13 @@
+[package]
+name = "big-head-shard"
+version = "0.1.0"
+edition = "2024"
+description = "Content sharding and projection — split large content and store blocks as ECS ShardData components"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+bevy_ecs = { workspace = true }
+
+[lints]
+workspace = true

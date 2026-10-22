@@ -1,0 +1,768 @@
+//! axum HTTP + WebSocket server that broadcasts `ViewCommand` to browsers.
+//!
+//! Architecture:
+//! - HTTP server on `http://localhost:{port}` (default 3030)
+//! - `/ws` WebSocket endpoint: browsers subscribe to ViewCommand stream
+//! - `/` static index.html (Vite-built R3F frontend, see `frontend/`)
+//! - Background task drains `ViewSink` and pushes commands to a `tokio::sync::broadcast`
+//!
+//! Flow:
+//! ```text
+//! Agent (LLM tool call) → ViewChannel.send(cmd)
+//!        ↓
+//! ViewServer.run()  ←  ViewSink.recv_command()
+//!        ↓
+//! broadcast::Sender.send(cmd_json)
+//!        ↓
+//! All connected WebSockets forward JSON to browser
+//! ```
+
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use axum::{
+    extract::ws::{Message, WebSocket, WebSocketUpgrade},
+    extract::State,
+    response::IntoResponse,
+    routing::get,
+    Router,
+};
+use futures::SinkExt;
+use once_cell::sync::OnceCell;
+use serde::{Deserialize, Serialize};
+use tokio::sync::{broadcast, Mutex as AsyncMutex};
+use tower_http::cors::CorsLayer;
+use tower_http::services::ServeDir;
+
+use crate::channel::{ViewEvent, ViewSink};
+use crate::protocol::{ContentPatch, PanelContent, PanelKind, ViewCommand};
+
+/// Server state shared across all axum handlers.
+#[derive(Clone)]
+struct AppState {
+    cmd_tx: broadcast::Sender<String>,
+    /// Server-side snapshot of all live panels. Each `ViewCommand` is mirrored
+    /// here so reconnecting browsers can hydrate from server truth rather than
+    /// accumulating state from the broadcast stream (which they may have
+    /// joined late or missed while disconnected).
+    snapshot: Arc<AsyncMutex<HashMap<String, StoredPanel>>>,
+}
+
+/// One panel's worth of persistent state. We store the same fields as
+/// `ViewCommand::Spawn` plus content, which is enough to re-emit a fresh
+/// `Spawn` on client reconnect.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct StoredPanel {
+    id: String,
+    kind: PanelKind,
+    title: String,
+    position: [f32; 3],
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    rotation: Option<[f32; 3]>,
+    content: PanelContent,
+}
+
+impl StoredPanel {
+    fn to_spawn(&self) -> ViewCommand {
+        ViewCommand::Spawn {
+            id: self.id.clone(),
+            kind: self.kind.clone(),
+            title: self.title.clone(),
+            position: self.position,
+            rotation: self.rotation,
+            content: self.content.clone(),
+        }
+    }
+}
+
+/// Apply one `ViewCommand` to the in-memory snapshot map.
+///
+/// Sync (no `.await`) so the entire command — including all sub-commands of a
+/// `Batch` — is applied atomically under a single lock acquisition. Unknown
+/// panel IDs are logged but not fatal: the LLM may `Despawn` something the
+/// snapshot never saw (e.g. a panel from a previous run before restart).
+fn apply_to_snapshot(map: &mut HashMap<String, StoredPanel>, cmd: &ViewCommand) {
+    match cmd {
+        ViewCommand::Spawn {
+            id,
+            kind,
+            title,
+            position,
+            rotation,
+            content,
+        } => {
+            map.insert(
+                id.clone(),
+                StoredPanel {
+                    id: id.clone(),
+                    kind: kind.clone(),
+                    title: title.clone(),
+                    position: *position,
+                    rotation: *rotation,
+                    content: content.clone(),
+                },
+            );
+        }
+        ViewCommand::Update { id, patch } => {
+            let Some(panel) = map.get_mut(id) else {
+                log::warn!("snapshot: Update for unknown panel '{id}'");
+                return;
+            };
+            match patch {
+                ContentPatch::Full(new_content) => {
+                    panel.content = new_content.clone();
+                }
+                ContentPatch::DataModel { path, .. } => {
+                    // DataModel patches target nested values inside PanelContent
+                    // (a serde-tagged enum). Re-applying them to our cached copy
+                    // requires turning PanelContent back into Value, applying
+                    // the JSON pointer, and re-serializing — error-prone for
+                    // v1. We log a warning so it's visible in the agent's
+                    // stream; reconnects will see pre-patch content until the
+                    // next `Full` patch lands.
+                    log::warn!(
+                        "snapshot: DataModel patch on '{id}' path={path} not mirrored; \
+                         reconnect will see pre-patch content"
+                    );
+                }
+            }
+        }
+        ViewCommand::Move {
+            id,
+            position,
+            rotation,
+            ..
+        } => {
+            let Some(panel) = map.get_mut(id) else {
+                log::warn!("snapshot: Move for unknown panel '{id}'");
+                return;
+            };
+            panel.position = *position;
+            if let Some(r) = rotation {
+                panel.rotation = Some(*r);
+            }
+        }
+        ViewCommand::Scale { id, scale } => {
+            // `ViewCommand::Spawn` has no `scale` field — Scale is applied
+            // renderer-side only. We log at debug and don't track.
+            if let Some(panel) = map.get(id) {
+                log::debug!(
+                    "snapshot: Scale on '{}' = {scale:?} not persisted (no Spawn field)",
+                    panel.id
+                );
+            } else {
+                log::warn!("snapshot: Scale for unknown panel '{id}'");
+            }
+        }
+        ViewCommand::Despawn { id } => {
+            map.remove(id);
+        }
+        ViewCommand::Batch { commands } => {
+            for sub in commands {
+                apply_to_snapshot(map, sub);
+            }
+        }
+        ViewCommand::Highlight { .. } => {
+            // Transient visual effect with a wall-clock `duration_ms`. Not
+            // meaningful to persist — the deadline would be wrong after even
+            // a short delay.
+        }
+    }
+}
+
+/// Opaque handle to the panel snapshot for persistence across restarts.
+///
+/// Obtain via [`ViewServer::snapshot_handle`] before spawning the server.
+/// `save()` serializes the current panel set to disk; `load()` reads it
+/// back and returns the [`ViewCommand::Spawn`] commands needed to
+/// re-broadcast to connected browsers.
+pub struct ViewSnapshotHandle {
+    inner: Arc<AsyncMutex<HashMap<String, StoredPanel>>>,
+}
+
+impl ViewSnapshotHandle {
+    /// Serialize current panel snapshot to a JSON file.
+    pub async fn save(&self, path: &std::path::Path) -> Result<(), String> {
+        let map = self.inner.lock().await;
+        let json = serde_json::to_string_pretty(&*map).map_err(|e| e.to_string())?;
+        std::fs::write(path, json).map_err(|e| e.to_string())
+    }
+
+    /// Load panel snapshot from JSON and return spawn commands for
+    /// re-broadcast. The in-memory snapshot is also replaced.
+    pub async fn load(&self, path: &std::path::Path) -> Result<Vec<ViewCommand>, String> {
+        let json = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+        let map: HashMap<String, StoredPanel> =
+            serde_json::from_str(&json).map_err(|e| e.to_string())?;
+        let spawns: Vec<ViewCommand> = map.values().map(|p| p.to_spawn()).collect();
+        let mut guard = self.inner.lock().await;
+        *guard = map;
+        Ok(spawns)
+    }
+}
+
+/// `ViewServer` —— owns the port and the dispatch task.
+pub struct ViewServer {
+    sink: ViewSink,
+    port: u16,
+    /// Capacity of internal broadcast channel. Each command = 1 slot.
+    broadcast_capacity: usize,
+    /// Server-side panel snapshot. Created eagerly so `main.rs` can
+    /// persist it across restarts.
+    snapshot: Arc<AsyncMutex<HashMap<String, StoredPanel>>>,
+}
+
+impl ViewServer {
+    pub fn new(sink: ViewSink, port: u16) -> Self {
+        Self {
+            sink,
+            port,
+            broadcast_capacity: 256,
+            snapshot: Arc::new(AsyncMutex::new(HashMap::new())),
+        }
+    }
+
+    /// Override broadcast capacity (default 256).
+    pub fn with_broadcast_capacity(mut self, cap: usize) -> Self {
+        self.broadcast_capacity = cap;
+        self
+    }
+
+    /// Return an opaque handle that can persist / restore the panel
+    /// snapshot across restarts. Call before moving `self` into
+    /// `run()` or `run_with_global_sink()`.
+    pub fn snapshot_handle(&self) -> ViewSnapshotHandle {
+        ViewSnapshotHandle { inner: self.snapshot.clone() }
+    }
+
+    /// Run the server. Blocks until shutdown (or error).
+    pub async fn run(self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let (cmd_tx, _) = broadcast::channel::<String>(self.broadcast_capacity);
+        let state = AppState {
+            cmd_tx: cmd_tx.clone(),
+            snapshot: self.snapshot.clone(),
+        };
+
+        // Task 1: drain ViewSink → broadcast channel + mirror to snapshot
+        let sink = self.sink.clone();
+        let dispatch_handle = tokio::spawn(async move {
+            dispatch_loop(sink, cmd_tx, self.snapshot.clone()).await;
+        });
+
+        // Task 2: axum HTTP + WebSocket
+        let app = Router::new()
+            .route("/ws", get(ws_handler))
+            .route("/health", get(health_handler))
+            .with_state(state)
+            // Serve frontend dist (built by Vite). Path relative to workspace root.
+            .fallback_service(ServeDir::new("crates/big-head-view/frontend/dist").fallback(ServeDir::new(".")))
+            .layer(CorsLayer::permissive());
+
+        let addr = std::net::SocketAddr::from(([0, 0, 0, 0], self.port));
+        log::info!("big-head-view server listening on http://{addr}");
+        log::info!("WebSocket: ws://{addr}/ws");
+
+        let listener = tokio::net::TcpListener::bind(addr).await?;
+        let serve_result = axum::serve(listener, app).await;
+
+        // If server exits, cancel dispatch task
+        dispatch_handle.abort();
+        serve_result.map_err(|e| e.into())
+    }
+}
+
+/// Apply a `ViewCommand` to the snapshot and broadcast to all subscribers.
+///
+/// Single chokepoint for "emit a ViewCommand". Two paths feed in:
+/// - `dispatch_loop` for LLM-originated commands (via ViewSink)
+/// - `client_connection` for user-drag-synthesized `Move` commands
+///
+/// Keeping the logic in one place ensures the snapshot is always in sync
+/// with what subscribers see, regardless of origin.
+async fn emit_view_command(
+    cmd: &ViewCommand,
+    cmd_tx: &broadcast::Sender<String>,
+    snapshot: &Arc<AsyncMutex<HashMap<String, StoredPanel>>>,
+) {
+    // 1. Mirror into snapshot first. If broadcast has no subscribers (no
+    //    browser open), the snapshot is still up to date so a future
+    //    reconnect hydrates correctly.
+    {
+        let mut map = snapshot.lock().await;
+        apply_to_snapshot(&mut map, cmd);
+    }
+
+    // 2. Serialize and broadcast. send() returns Err if no subscribers —
+    //    that's fine, the browser may not be open.
+    if let Ok(json) = serde_json::to_string(cmd) {
+        let _ = cmd_tx.send(json);
+    } else {
+        log::error!("ViewCommand serialize failed (op={:?})", cmd);
+    }
+}
+
+/// Dispatch loop: ViewSink → emit().
+async fn dispatch_loop(
+    sink: ViewSink,
+    cmd_tx: broadcast::Sender<String>,
+    snapshot: Arc<AsyncMutex<HashMap<String, StoredPanel>>>,
+) {
+    loop {
+        match sink.recv_command().await {
+            Some(cmd) => emit_view_command(&cmd, &cmd_tx, &snapshot).await,
+            None => {
+                log::info!("view sink closed, dispatch loop exiting");
+                break;
+            }
+        }
+    }
+}
+
+/// Build a `ViewCommand::Move` from a renderer-side drag_end event.
+///
+/// Exposed (not inlined) so we can unit-test the drag path without a WebSocket.
+fn move_from_drag_end(panel_id: String, position: [f32; 3]) -> ViewCommand {
+    ViewCommand::Move {
+        id: panel_id,
+        position,
+        rotation: None,
+        duration_ms: None,
+    }
+}
+
+/// WebSocket handler. Upgrade → subscribe to broadcast.
+async fn ws_handler(
+    ws: WebSocketUpgrade,
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    ws.on_upgrade(move |socket| client_connection(socket, state))
+}
+
+/// Per-client connection. Forwards broadcast → socket, and form-submit events → sink.
+async fn client_connection(socket: WebSocket, state: AppState) {
+    let sink = get_global_sink();
+    let (mut sender, mut receiver) = socket.split();
+
+    // Hydrate new client from the server-side snapshot BEFORE subscribing to
+    // live updates. We send a `Batch { commands: [Spawn × N] }` so the
+    // frontend applies one combined command (single reducer tick).
+    //
+    // Tiny race window: a Spawn that lands between the snapshot read and
+    // `subscribe()` is delivered twice (once via Batch, once via broadcast).
+    // The frontend's applyCommand is idempotent for same-id Spawn, so this
+    // is benign — at worst a re-render with the same data.
+    {
+        let map = state.snapshot.lock().await;
+        if !map.is_empty() {
+            let commands: Vec<ViewCommand> =
+                map.values().map(StoredPanel::to_spawn).collect();
+            let batch = ViewCommand::Batch { commands };
+            match serde_json::to_string(&batch) {
+                Ok(json) => {
+                    if sender.send(Message::Text(json)).await.is_err() {
+                        log::debug!("snapshot hydrate failed (client disconnected)");
+                        return;
+                    }
+                }
+                Err(e) => log::error!("snapshot serialize failed: {e}"),
+            }
+        }
+    }
+
+    let mut rx = state.cmd_tx.subscribe();
+
+    // Spawn send-task: broadcast → socket
+    let send_task = tokio::spawn(async move {
+        while let Ok(msg) = rx.recv().await {
+            if sender.send(Message::Text(msg)).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    // Receive-task: socket → ViewEvent
+    //
+    // DragEnd is handled specially: we synthesize a `ViewCommand::Move` and
+    // route it through `emit_view_command` so the snapshot stays in sync
+    // and other connected clients see the move. Other events (view_event,
+    // ready) go to the agent via the sink for the runtime to
+    // process — we don't synthesize commands for them.
+    while let Some(msg) = receiver.next().await {
+        match msg {
+            Ok(Message::Text(text)) => {
+                if let Some(event) = parse_client_event(&text) {
+                    match event {
+                        ViewEvent::DragEnd { panel_id, position } => {
+                            let move_cmd = move_from_drag_end(panel_id, position);
+                            emit_view_command(&move_cmd, &state.cmd_tx, &state.snapshot).await;
+                        }
+                        other => {
+                            if let Some(sink) = sink.lock().await.as_ref() {
+                                sink.send_event(other);
+                            }
+                        }
+                    }
+                }
+            }
+            Ok(Message::Close(_)) => break,
+            Err(e) => {
+                log::debug!("ws recv error: {e}");
+                break;
+            }
+            _ => {}
+        }
+    }
+    send_task.abort();
+}
+
+/// Parse client → agent event. Expected format:
+/// ```json
+/// { "type": "view_event", "panel_id": "...", "data": { ... } }
+/// { "type": "ready", "client_id": "..." }
+/// { "type": "drag_end", "id": "...", "position": [x, y, z] }
+/// ```
+///
+/// `view_event.data` 嘅 schema 由 agent 喺 spawn panel 嗰阵定义 —— server
+/// 唔 validate, pass-through 畀 agent 自己解.
+fn parse_client_event(text: &str) -> Option<ViewEvent> {
+    let v: serde_json::Value = serde_json::from_str(text).ok()?;
+    let ty = v.get("type")?.as_str()?;
+    match ty {
+        "view_event" => Some(ViewEvent::ViewEvent {
+            panel_id: v.get("panel_id")?.as_str()?.to_string(),
+            data: v.get("data").cloned().unwrap_or(serde_json::Value::Null),
+        }),
+        "drag_end" => {
+            let id = v.get("id")?.as_str()?.to_string();
+            let pos = v.get("position")?.as_array()?;
+            let x = pos.get(0)?.as_f64()? as f32;
+            let y = pos.get(1)?.as_f64()? as f32;
+            let z = pos.get(2)?.as_f64()? as f32;
+            Some(ViewEvent::DragEnd { panel_id: id, position: [x, y, z] })
+        },
+        "ready" => Some(ViewEvent::Ready {
+            client_id: v.get("client_id")?.as_str()?.to_string(),
+        }),
+        _ => {
+            log::warn!("unknown client event type: {ty}");
+            None
+        }
+    }
+}
+
+async fn health_handler() -> &'static str {
+    "ok"
+}
+
+// ─── Global sink (so ws_handler can push events back to agent) ───
+//
+// The view server is created with a sink, but the ws_handler closure
+// doesn't capture it directly. We stash it in a global Mutex<Option<...>>
+// when dispatch_loop starts. This is a simplification — for full correctness
+// we'd thread the sink through AppState. But for a single-process PoC it works.
+
+static GLOBAL_SINK: OnceCell<Arc<AsyncMutex<Option<ViewSink>>>> = OnceCell::new();
+
+fn get_global_sink() -> Arc<AsyncMutex<Option<ViewSink>>> {
+    GLOBAL_SINK
+        .get_or_init(|| Arc::new(AsyncMutex::new(None)))
+        .clone()
+}
+
+// In `run`, we register the sink so ws_handler can find it.
+impl ViewServer {
+    /// Same as `run` but registers the sink globally so `ws_handler`
+    /// can route client events back to the agent.
+    pub async fn run_with_global_sink(self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        // Register sink
+        {
+            let g = get_global_sink();
+            let mut guard = g.lock().await;
+            *guard = Some(self.sink.clone());
+        }
+        self.run().await
+    }
+}
+
+// We need `tokio::sync::Mutex` and `axum::extract::ws::WebSocket::split`.
+// The split method requires the futures::StreamExt trait.
+use futures::StreamExt;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::channel::ViewChannel;
+    use crate::protocol::{PanelContent, PanelKind};
+
+    #[test]
+    fn parse_view_event_with_form_data() {
+        let raw = r#"{"type":"view_event","panel_id":"p1","data":{"name":"alice","age":30}}"#;
+        let evt = parse_client_event(raw).expect("parsed");
+        match evt {
+            ViewEvent::ViewEvent { panel_id, data } => {
+                assert_eq!(panel_id, "p1");
+                assert_eq!(data["name"], "alice");
+                assert_eq!(data["age"], 30);
+            }
+            _ => panic!("expected ViewEvent"),
+        }
+    }
+
+    #[test]
+    fn parse_view_event_with_action_data() {
+        // A2UI button click: data shape 由 agent 喺 spawn 嗰阵定义.
+        let raw = r#"{"type":"view_event","panel_id":"p1","data":{"component_id":"btn1","x":1}}"#;
+        let evt = parse_client_event(raw).expect("parsed");
+        match evt {
+            ViewEvent::ViewEvent { panel_id, data } => {
+                assert_eq!(panel_id, "p1");
+                assert_eq!(data["component_id"], "btn1");
+                assert_eq!(data["x"], 1);
+            }
+            _ => panic!("expected ViewEvent"),
+        }
+    }
+
+    #[test]
+    fn parse_view_event_missing_data_defaults_to_null() {
+        let raw = r#"{"type":"view_event","panel_id":"p1"}"#;
+        let evt = parse_client_event(raw).expect("parsed");
+        match evt {
+            ViewEvent::ViewEvent { panel_id, data } => {
+                assert_eq!(panel_id, "p1");
+                assert_eq!(data, serde_json::Value::Null);
+            }
+            _ => panic!("expected ViewEvent"),
+        }
+    }
+
+    #[test]
+    fn parse_drag_end_event() {
+        let raw = r#"{"type":"drag_end","id":"panel-1","position":[1.5,-0.3,0.0]}"#;
+        let evt = parse_client_event(raw).expect("parsed");
+        match evt {
+            ViewEvent::DragEnd { panel_id, position } => {
+                assert_eq!(panel_id, "panel-1");
+                assert_eq!(position, [1.5, -0.3, 0.0]);
+            }
+            _ => panic!("expected DragEnd"),
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatch_loop_broadcasts_command() {
+        let (channel, sink) = ViewChannel::new();
+        let (tx, mut rx) = broadcast::channel::<String>(16);
+        let sink2 = sink.clone();
+        let snapshot: Arc<AsyncMutex<HashMap<String, StoredPanel>>> =
+            Arc::new(AsyncMutex::new(HashMap::new()));
+        let snapshot2 = snapshot.clone();
+        tokio::spawn(async move {
+            dispatch_loop(sink2, tx, snapshot2).await;
+        });
+
+        channel.send(ViewCommand::Spawn {
+            id: "p1".into(),
+            kind: PanelKind::Card,
+            title: "Test".into(),
+            position: [0.0; 3],
+            rotation: None,
+            content: PanelContent::Card {
+                label: "x".into(),
+                value: serde_json::json!(1),
+                unit: None,
+                trend: None,
+            },
+        });
+
+        let msg = rx.recv().await.expect("got broadcast");
+        assert!(msg.contains("\"op\":\"spawn\""));
+        assert!(msg.contains("\"id\":\"p1\""));
+
+        // Snapshot mirrors the broadcast
+        let map = snapshot.lock().await;
+        assert!(map.contains_key("p1"));
+        let p = &map["p1"];
+        assert_eq!(p.title, "Test");
+        assert_eq!(p.position, [0.0; 3]);
+    }
+
+    fn spawn_cmd(id: &str, label: &str) -> ViewCommand {
+        ViewCommand::Spawn {
+            id: id.into(),
+            kind: PanelKind::Card,
+            title: format!("T-{id}"),
+            position: [0.0; 3],
+            rotation: None,
+            content: PanelContent::Card {
+                label: label.into(),
+                value: serde_json::json!(0),
+                unit: None,
+                trend: None,
+            },
+        }
+    }
+
+    fn card_panel(id: &str, label: &str) -> StoredPanel {
+        StoredPanel {
+            id: id.into(),
+            kind: PanelKind::Card,
+            title: format!("T-{id}"),
+            position: [0.0; 3],
+            rotation: None,
+            content: PanelContent::Card {
+                label: label.into(),
+                value: serde_json::json!(0),
+                unit: None,
+                trend: None,
+            },
+        }
+    }
+
+    #[test]
+    fn snapshot_spawn_inserts() {
+        let mut map = HashMap::new();
+        apply_to_snapshot(&mut map, &spawn_cmd("p1", "alpha"));
+        assert!(map.contains_key("p1"));
+        assert_eq!(map["p1"].title, "T-p1");
+    }
+
+    #[test]
+    fn snapshot_move_updates_position() {
+        let mut map = HashMap::new();
+        map.insert("p1".into(), card_panel("p1", "x"));
+        apply_to_snapshot(
+            &mut map,
+            &ViewCommand::Move {
+                id: "p1".into(),
+                position: [1.5, -2.0, 3.5],
+                rotation: None,
+                duration_ms: None,
+            },
+        );
+        assert_eq!(map["p1"].position, [1.5, -2.0, 3.5]);
+    }
+
+    #[test]
+    fn snapshot_update_full_replaces_content() {
+        let mut map = HashMap::new();
+        map.insert("p1".into(), card_panel("p1", "old"));
+        apply_to_snapshot(
+            &mut map,
+            &ViewCommand::Update {
+                id: "p1".into(),
+                patch: ContentPatch::Full(PanelContent::Card {
+                    label: "new".into(),
+                    value: serde_json::json!(99),
+                    unit: None,
+                    trend: None,
+                }),
+            },
+        );
+        match &map["p1"].content {
+            PanelContent::Card { label, value, .. } => {
+                assert_eq!(label, "new");
+                assert_eq!(value, &serde_json::json!(99));
+            }
+            _ => panic!("expected Card content"),
+        }
+    }
+
+    #[test]
+    fn snapshot_despawn_removes() {
+        let mut map = HashMap::new();
+        map.insert("p1".into(), card_panel("p1", "x"));
+        apply_to_snapshot(&mut map, &ViewCommand::Despawn { id: "p1".into() });
+        assert!(!map.contains_key("p1"));
+    }
+
+    #[test]
+    fn snapshot_batch_applies_all_atomically() {
+        let mut map = HashMap::new();
+        apply_to_snapshot(
+            &mut map,
+            &ViewCommand::Batch {
+                commands: vec![
+                    spawn_cmd("p1", "a"),
+                    spawn_cmd("p2", "b"),
+                    ViewCommand::Despawn { id: "p1".into() },
+                ],
+            },
+        );
+        assert!(!map.contains_key("p1"));
+        assert!(map.contains_key("p2"));
+    }
+
+    #[test]
+    fn snapshot_highlight_skipped() {
+        let mut map = HashMap::new();
+        map.insert("p1".into(), card_panel("p1", "x"));
+        apply_to_snapshot(
+            &mut map,
+            &ViewCommand::Highlight {
+                id: "p1".into(),
+                effect: crate::protocol::HighlightEffect::Pulse { color: "#fff".into() },
+                duration_ms: 500,
+            },
+        );
+        // Panel still present, unchanged
+        assert!(map.contains_key("p1"));
+    }
+
+    #[test]
+    fn snapshot_unknown_panel_warns_but_no_panic() {
+        let mut map = HashMap::new();
+        apply_to_snapshot(
+            &mut map,
+            &ViewCommand::Move {
+                id: "ghost".into(),
+                position: [0.0; 3],
+                rotation: None,
+                duration_ms: None,
+            },
+        );
+        assert!(map.is_empty());
+    }
+
+    #[test]
+    fn move_from_drag_end_builds_move_command() {
+        let cmd = move_from_drag_end("p1".into(), [1.5, -2.0, 0.0]);
+        match cmd {
+            ViewCommand::Move { id, position, rotation, duration_ms } => {
+                assert_eq!(id, "p1");
+                assert_eq!(position, [1.5, -2.0, 0.0]);
+                assert!(rotation.is_none());
+                assert!(duration_ms.is_none());
+            }
+            _ => panic!("expected Move"),
+        }
+    }
+
+    #[tokio::test]
+    async fn drag_end_emits_move_and_updates_snapshot() {
+        // Simulate the receive-task path: parse drag_end, synthesize Move,
+        // emit. Verify both broadcast and snapshot are updated.
+        let (cmd_tx, mut rx) = broadcast::channel::<String>(16);
+        let snapshot: Arc<AsyncMutex<HashMap<String, StoredPanel>>> =
+            Arc::new(AsyncMutex::new(HashMap::new()));
+        // Pre-populate snapshot with a panel
+        {
+            let mut map = snapshot.lock().await;
+            map.insert("p1".into(), card_panel("p1", "x"));
+        }
+
+        // Synthesize a drag_end via the helper
+        let move_cmd = move_from_drag_end("p1".into(), [2.0, 3.0, 4.0]);
+        emit_view_command(&move_cmd, &cmd_tx, &snapshot).await;
+
+        // Snapshot reflects new position
+        let map = snapshot.lock().await;
+        assert_eq!(map["p1"].position, [2.0, 3.0, 4.0]);
+
+        // Broadcast was sent
+        let msg = rx.recv().await.expect("got broadcast");
+        assert!(msg.contains("\"op\":\"move\""));
+        assert!(msg.contains("\"id\":\"p1\""));
+        assert!(msg.contains("2.0") && msg.contains("3.0") && msg.contains("4.0"));
+    }
+}

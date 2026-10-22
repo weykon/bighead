@@ -1,0 +1,15 @@
+[package]
+name = "big-head-ecs"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+bevy_ecs = { path = "../../vendor/bevy_ecs", features = ["debug"] }
+bevy_reflect = { path = "../../vendor/bevy_reflect" }
+ai_api_provider = { path = "../../external/ai_api_provider" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+
+[lints]
+workspace = true

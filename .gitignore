@@ -1,0 +1,29 @@
+/target
+**/target
+*.swp
+*.swo
+.DS_Store
+.env
+.big-head/
+.vscode/
+.zed/
+big_head_checkpoint.json
+/outputs
+/dist
+**/.build
+
+# Local configuration and credentials
+.env.*
+!.env.example
+.claude/
+.playwright-mcp/
+**/node_modules/
+*.log
+
+# Personal runtime state and generated artifacts
+big_head_view_snapshot.json
+big_head_worlds/
+crates/big-head-loop/outputs/
+resume_*
+docs/interview-prep/
+fly-mode-*.png

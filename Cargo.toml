@@ -1,0 +1,87 @@
+[workspace]
+members = [
+    # Crates
+    "external/ai_api_provider",
+    "crates/big-head-ecs",
+    "crates/big-head-query",
+    "crates/big-head-ai",
+    "crates/big-head-loop",
+    "crates/big-head-script",
+    "crates/big-head-save",
+    "crates/big-head-cli",
+    "crates/big-head-shard",
+    "crates/big-head-state",
+    "crates/big-head-view",
+    "crates/big-head-world",
+]
+# vendor/ 是 bevy 上游源码副本（path 依赖，crates/big-head-{ecs,loop} 透过 path = "../../vendor/bevy_ecs" 引入）。
+# 不放进 members 是为了避免 cargo fmt --all 等 workspace 级命令误把它一并格式化、产生纯 import 排序 / 折行重排的噪声 diff。
+exclude = [
+    "vendor/bevy_ecs",
+    "vendor/bevy_ecs/macros",
+    "vendor/bevy_ptr",
+    "vendor/bevy_utils",
+    "vendor/bevy_tasks",
+    "vendor/bevy_platform",
+    "vendor/bevy_reflect",
+    "vendor/bevy_reflect/derive",
+    "vendor/bevy_macro_utils",
+]
+resolver = "3"
+
+[workspace.package]
+edition = "2024"
+license = "MIT"
+
+[workspace.lints.rust]
+rust_2018_idioms = "warn"
+unsafe_op_in_unsafe_fn = "warn"
+
+[workspace.lints.clippy]
+dbg_macro = "warn"
+todo = "warn"
+
+[workspace.dependencies]
+bevy_ecs = { path = "vendor/bevy_ecs", features = ["debug"] }
+bevy_reflect = { path = "vendor/bevy_reflect" }
+bevy_ptr = { path = "vendor/bevy_ptr" }
+
+serde = { version = "1.0.221", features = ["derive", "rc"] }
+serde_json = { version = "1.0.144", features = ["preserve_order", "raw_value"] }
+thiserror = "2.0.12"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "io-util", "time", "signal"] }
+log = { version = "0.4.16", features = ["kv_unstable_serde", "serde"] }
+rhai = { version = "1", features = ["sync"] }
+uuid = { version = "1.0", features = ["v4", "serde"] }
+reqwest = { version = "0.12", features = ["json"] }
+futures = "0.3"
+parking_lot = "0.12.1"
+smallvec = { version = "1.6", features = ["union", "const_new"] }
+
+[package]
+name = "big-head"
+version = "0.1.0"
+edition = "2024"
+license.workspace = true
+repository = "https://github.com/weykon/bighead"
+readme = "README.md"
+
+[dependencies]
+big-head-loop = { path = "crates/big-head-loop" }
+big-head-ai = { path = "crates/big-head-ai" }
+big-head-state = { path = "crates/big-head-state" }
+big-head-view = { path = "crates/big-head-view" }
+big-head-world = { path = "crates/big-head-world" }
+ai_api_provider = { path = "external/ai_api_provider" }
+bevy_ecs = { path = "vendor/bevy_ecs", features = ["debug"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["sync"] }
+axum = { version = "0.7", features = ["macros"] }
+uuid = { workspace = true }
+log = { workspace = true }
+dotenvy = "0.15"
+rustyline = "14"
+termimad = "0.34.1"
+crossterm = "0.29"
+unicode-width = "0.1"

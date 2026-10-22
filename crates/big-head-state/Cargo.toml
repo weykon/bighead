@@ -1,0 +1,13 @@
+[package]
+name = "big-head-state"
+version = "0.1.0"
+edition = "2024"
+description = "Agent activity/state tracking — hook-based observable state with terminal rendering"
+
+[dependencies]
+tokio = { workspace = true, features = ["sync"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[lints]
+workspace = true
